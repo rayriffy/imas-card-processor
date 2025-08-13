@@ -214,6 +214,12 @@ def crop_cells_from_grid(
     card_aspect_tolerance: float = 0.15,
     first_row_at_image_top: bool = False,
     anchor_top_max_shift_px: int = 12,
+    normalize_height: bool = False,
+    height_tolerance_ratio: float = 0.04,
+    row_align: str = "auto",
+    row_align_tolerance_px: int = 4,
+    normalize_width_per_row: bool = False,
+    width_tolerance_ratio: float = 0.05,
 ) -> int:
     saved = 0
     num_rows = max(0, len(horizontal_positions) - 1)
@@ -223,6 +229,10 @@ def crop_cells_from_grid(
     debug_overlay = None
     if debug_overlay_path:
         debug_overlay = image_bgr.copy()
+
+    # Stage all detected rectangles first, then optionally normalize heights, then save
+    staged: List[Tuple[int, int, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = []
+    # Each entry: (row_index, col_index, allowed_cell_bounds(x0,y0,x1,y1), final_rect_abs(x0,y0,x1,y1))
 
     for row_index in range(num_rows):
         y1 = horizontal_positions[row_index]
@@ -236,13 +246,13 @@ def crop_cells_from_grid(
             x_start = max(x1 + inner_margin_px, 0)
             x_end = max(min(x2 - inner_margin_px, image_bgr.shape[1]), x_start + 1)
 
-            card = image_bgr[y_start:y_end, x_start:x_end]
-            # Track the rectangle that corresponds to what we actually saved
+            # Initial final rect equals inner-margin cell
             final_abs_x0, final_abs_y0, final_abs_x1, final_abs_y1 = x_start, y_start, x_end, y_end
             if tighten_to_card:
+                cell_img = image_bgr[y_start:y_end, x_start:x_end]
                 if tighten_size_constrained:
                     tightened_img, bbox = tighten_crop_to_card_edges_size_constrained(
-                        cell_bgr=card,
+                        cell_bgr=cell_img,
                         margin_px=tighten_margin_px,
                         aspect_target=card_aspect,
                         aspect_tolerance=card_aspect_tolerance,
@@ -250,31 +260,220 @@ def crop_cells_from_grid(
                         anchor_top_max_shift_px=anchor_top_max_shift_px,
                     )
                 else:
-                    tightened_img, bbox = tighten_crop_to_card_edges(card, tighten_margin_px)
+                    tightened_img, bbox = tighten_crop_to_card_edges(cell_img, tighten_margin_px)
                 if tightened_img is not None and tightened_img.size != 0:
-                    card = tightened_img
                     bx0, by0, bx1, by1 = bbox
                     final_abs_x0 = x_start + int(bx0)
                     final_abs_y0 = y_start + int(by0)
                     final_abs_x1 = x_start + int(bx1)
                     final_abs_y1 = y_start + int(by1)
-            # Draw the final rectangle (tightened if applied, otherwise inner-margin box)
-            if debug_overlay is not None:
-                cv2.rectangle(
-                    debug_overlay,
-                    (int(final_abs_x0), int(final_abs_y0)),
-                    (int(final_abs_x1 - 1), int(final_abs_y1 - 1)),
-                    (0, 0, 255),
-                    2,
-                )
-            if card.size == 0:
-                continue
 
-            row_label = f"{row_index + 1:0{pad_fmt}d}" if zero_pad else f"{row_index + 1}"
-            col_label = f"{col_index + 1:0{pad_fmt}d}" if zero_pad else f"{col_index + 1}"
-            filename = f"{row_label}-{col_label}.png"
-            cv2.imwrite(os.path.join(output_dir, filename), card)
-            saved += 1
+            # Stash allowed bounds (inner-margin cell) and final rect
+            staged.append(
+                (
+                    row_index,
+                    col_index,
+                    (x_start, y_start, x_end, y_end),
+                    (final_abs_x0, final_abs_y0, final_abs_x1, final_abs_y1),
+                )
+            )
+
+    # Optional height normalization pass
+    if normalize_height and staged:
+        heights = [abs(rect[3][3] - rect[3][1]) for rect in staged]
+        # Cluster heights within relative tolerance
+        sorted_indices = sorted(range(len(heights)), key=lambda i: heights[i])
+        clusters: List[List[int]] = []  # lists of indices
+        for idx in sorted_indices:
+            h = heights[idx]
+            placed = False
+            for cluster in clusters:
+                median_h = float(np.median([heights[i] for i in cluster]))
+                if abs(h - median_h) <= height_tolerance_ratio * max(median_h, 1.0):
+                    cluster.append(idx)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([idx])
+        # Pick largest cluster; use its median as target height
+        best_cluster = max(clusters, key=lambda c: len(c)) if clusters else []
+        target_height = int(round(float(np.median([heights[i] for i in best_cluster])))) if best_cluster else None
+        if target_height and len(best_cluster) >= 2:
+            print(f"Height normalization: target={target_height}px from {len(best_cluster)}/{len(staged)} cards (tolerance {height_tolerance_ratio*100:.1f}%).")
+            # Adjust each staged rect to target height, bounded by its allowed cell
+            new_staged: List[Tuple[int, int, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = []
+            for (row_index, col_index, allowed, rect) in staged:
+                x0a, y0a, x1a, y1a = allowed
+                rx0, ry0, rx1, ry1 = rect
+                current_h = ry1 - ry0
+                # If already close enough, keep
+                if abs(current_h - target_height) <= max(1, int(height_tolerance_ratio * target_height)):
+                    new_rect = (rx0, ry0, rx1, ry1)
+                else:
+                    # Compute centered adjustment
+                    center_y = (ry0 + ry1) // 2
+                    new_y0 = center_y - target_height // 2
+                    new_y1 = new_y0 + target_height
+                    # Anchor top for first row if requested and close to allowed top
+                    if first_row_at_image_top and row_index == 0:
+                        if (ry0 - y0a) <= max(anchor_top_max_shift_px, 0):
+                            new_y0 = y0a
+                            new_y1 = new_y0 + target_height
+                    # Clamp within allowed bounds
+                    if new_y0 < y0a:
+                        new_y0 = y0a
+                        new_y1 = new_y0 + target_height
+                    if new_y1 > y1a:
+                        new_y1 = y1a
+                        new_y0 = new_y1 - target_height
+                    # If still invalid, shrink to fit
+                    if new_y1 <= new_y0:
+                        new_y0 = max(y0a, ry0)
+                        new_y1 = min(y1a, ry1)
+                    new_rect = (rx0, new_y0, rx1, new_y1)
+                new_staged.append((row_index, col_index, allowed, new_rect))
+            staged = new_staged
+
+    # Optional row-level vertical alignment
+    if staged:
+        # Group by row
+        rows: dict[int, List[int]] = {}
+        for i, (row_index, _col_index, _allowed, _rect) in enumerate(staged):
+            rows.setdefault(row_index, []).append(i)
+
+        def robust_spread(values: List[int]) -> float:
+            if not values:
+                return float("inf")
+            q1 = np.percentile(values, 25)
+            q3 = np.percentile(values, 75)
+            return float(q3 - q1)
+
+        new_staged_align: List[Tuple[int, int, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = staged[:]
+        for row_index, indices in rows.items():
+            tops = [staged[i][3][1] for i in indices]
+            bottoms = [staged[i][3][3] for i in indices]
+            # Decide anchor
+            anchor_mode = row_align
+            if anchor_mode == "auto":
+                spread_top = robust_spread(tops)
+                spread_bottom = robust_spread(bottoms)
+                anchor_mode = "top" if spread_top <= spread_bottom else "bottom"
+            if anchor_mode == "top":
+                target_y = int(round(float(np.median(tops))))
+                for i in indices:
+                    row_i, col_i, allowed, rect = new_staged_align[i]
+                    x0a, y0a, x1a, y1a = allowed
+                    rx0, ry0, rx1, ry1 = rect
+                    h = ry1 - ry0
+                    # Only adjust if outside tolerance
+                    if abs(ry0 - target_y) > max(1, row_align_tolerance_px):
+                        new_y0 = target_y
+                        new_y1 = new_y0 + h
+                        # Clamp to allowed
+                        if new_y0 < y0a:
+                            new_y0 = y0a
+                            new_y1 = new_y0 + h
+                        if new_y1 > y1a:
+                            new_y1 = y1a
+                            new_y0 = new_y1 - h
+                        new_staged_align[i] = (row_i, col_i, allowed, (rx0, new_y0, rx1, new_y1))
+            else:  # bottom
+                target_y = int(round(float(np.median(bottoms))))
+                for i in indices:
+                    row_i, col_i, allowed, rect = new_staged_align[i]
+                    x0a, y0a, x1a, y1a = allowed
+                    rx0, ry0, rx1, ry1 = rect
+                    h = ry1 - ry0
+                    if abs(ry1 - target_y) > max(1, row_align_tolerance_px):
+                        new_y1 = target_y
+                        new_y0 = new_y1 - h
+                        if new_y0 < y0a:
+                            new_y0 = y0a
+                            new_y1 = new_y0 + h
+                        if new_y1 > y1a:
+                            new_y1 = y1a
+                            new_y0 = new_y1 - h
+                        new_staged_align[i] = (row_i, col_i, allowed, (rx0, new_y0, rx1, new_y1))
+        staged = new_staged_align
+
+    # Optional per-row width normalization
+    if normalize_width_per_row and staged:
+        # Group by row
+        rows: dict[int, List[int]] = {}
+        for i, (row_index, _col_index, _allowed, _rect) in enumerate(staged):
+            rows.setdefault(row_index, []).append(i)
+
+        def cluster_values(values: List[int], tol_ratio: float) -> List[List[int]]:
+            sorted_idx = sorted(range(len(values)), key=lambda i: values[i])
+            clusters: List[List[int]] = []
+            for idx in sorted_idx:
+                v = values[idx]
+                placed = False
+                for cluster in clusters:
+                    median_v = float(np.median([values[i] for i in cluster]))
+                    if abs(v - median_v) <= tol_ratio * max(median_v, 1.0):
+                        cluster.append(idx)
+                        placed = True
+                        break
+                if not placed:
+                    clusters.append([idx])
+            return clusters
+
+        new_staged_width: List[Tuple[int, int, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = staged[:]
+        for row_index, indices in rows.items():
+            widths = [staged[i][3][2] - staged[i][3][0] for i in indices]
+            clusters = cluster_values(widths, width_tolerance_ratio)
+            best_cluster = max(clusters, key=lambda c: len(c)) if clusters else []
+            target_width = int(round(float(np.median([widths[i] for i in best_cluster])))) if best_cluster else None
+            if target_width and len(best_cluster) >= 2:
+                print(
+                    f"Row {row_index+1}: width normalization target={target_width}px from {len(best_cluster)}/{len(indices)} cards (tol {width_tolerance_ratio*100:.1f}%)."
+                )
+                for j, i in enumerate(indices):
+                    row_i, col_i, allowed, rect = new_staged_width[i]
+                    x0a, y0a, x1a, y1a = allowed
+                    rx0, ry0, rx1, ry1 = rect
+                    current_w = rx1 - rx0
+                    if abs(current_w - target_width) <= max(1, int(width_tolerance_ratio * target_width)):
+                        continue
+                    # Center horizontally
+                    cx = (rx0 + rx1) // 2
+                    new_x0 = cx - target_width // 2
+                    new_x1 = new_x0 + target_width
+                    # Clamp to allowed bounds
+                    if new_x0 < x0a:
+                        new_x0 = x0a
+                        new_x1 = new_x0 + target_width
+                    if new_x1 > x1a:
+                        new_x1 = x1a
+                        new_x0 = new_x1 - target_width
+                    # If still invalid, shrink to fit
+                    if new_x1 <= new_x0:
+                        new_x0 = max(x0a, rx0)
+                        new_x1 = min(x1a, rx1)
+                    new_staged_width[i] = (row_i, col_i, allowed, (new_x0, ry0, new_x1, ry1))
+        staged = new_staged_width
+
+    # Now save all and draw debug overlay
+    for (row_index, col_index, _allowed, rect) in staged:
+        rx0, ry0, rx1, ry1 = rect
+        if debug_overlay is not None:
+            cv2.rectangle(
+                debug_overlay,
+                (int(rx0), int(ry0)),
+                (int(rx1 - 1), int(ry1 - 1)),
+                (0, 0, 255),
+                2,
+            )
+        # Save
+        crop = image_bgr[max(ry0, 0):max(ry1, 0), max(rx0, 0):max(rx1, 0)]
+        if crop.size == 0:
+            continue
+        row_label = f"{row_index + 1:0{pad_fmt}d}" if zero_pad else f"{row_index + 1}"
+        col_label = f"{col_index + 1:0{pad_fmt}d}" if zero_pad else f"{col_index + 1}"
+        filename = f"{row_label}-{col_label}.png"
+        cv2.imwrite(os.path.join(output_dir, filename), crop)
+        saved += 1
 
     if debug_overlay is not None:
         cv2.imwrite(debug_overlay_path, debug_overlay)
@@ -507,6 +706,40 @@ def main() -> None:
         help="When anchoring the first row to the top, allow this many pixels of slack from the cell's top.",
     )
     parser.add_argument(
+        "--normalize-height",
+        action="store_true",
+        help="Normalize the final crop height across cards using the most common height (within a tolerance).",
+    )
+    parser.add_argument(
+        "--height-tolerance-ratio",
+        type=float,
+        default=0.04,
+        help="Relative tolerance when clustering heights to find the dominant height (default: 0.04 = 4%).",
+    )
+    parser.add_argument(
+        "--row-align",
+        choices=["auto", "top", "bottom"],
+        default="auto",
+        help="Align cards vertically per row by top edge, bottom edge, or auto-select the straighter edge.",
+    )
+    parser.add_argument(
+        "--row-align-tolerance-px",
+        type=int,
+        default=4,
+        help="Only shift a crop to row alignment if it deviates by more than this many pixels (default: 4).",
+    )
+    parser.add_argument(
+        "--normalize-width-per-row",
+        action="store_true",
+        help="Within each row, normalize crop width to the dominant width (bounded by each cell).",
+    )
+    parser.add_argument(
+        "--width-tolerance-ratio",
+        type=float,
+        default=0.05,
+        help="Relative tolerance when clustering widths per row (default: 0.05 = 5%).",
+    )
+    parser.add_argument(
         "--rows",
         type=int,
         default=None,
@@ -618,6 +851,12 @@ def main() -> None:
         card_aspect_tolerance=float(args.card_aspect_tolerance),
         first_row_at_image_top=bool(args.first_row_at_image_top),
         anchor_top_max_shift_px=int(args.anchor_top_max_shift_px),
+        normalize_height=bool(args.normalize_height),
+        height_tolerance_ratio=float(args.height_tolerance_ratio),
+        row_align=str(args.row_align),
+        row_align_tolerance_px=int(args.row_align_tolerance_px),
+        normalize_width_per_row=bool(args.normalize_width_per_row),
+        width_tolerance_ratio=float(args.width_tolerance_ratio),
     )
 
     print(f"Saved {saved} cropped cards to: {args.output}")
