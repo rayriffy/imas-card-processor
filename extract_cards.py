@@ -209,6 +209,11 @@ def crop_cells_from_grid(
     tighten_to_card: bool,
     tighten_margin_px: int,
     debug_overlay_path: Optional[str] = None,
+    tighten_size_constrained: bool = False,
+    card_aspect: float = 1.75,
+    card_aspect_tolerance: float = 0.15,
+    first_row_at_image_top: bool = False,
+    anchor_top_max_shift_px: int = 12,
 ) -> int:
     saved = 0
     num_rows = max(0, len(horizontal_positions) - 1)
@@ -231,20 +236,37 @@ def crop_cells_from_grid(
             x_start = max(x1 + inner_margin_px, 0)
             x_end = max(min(x2 - inner_margin_px, image_bgr.shape[1]), x_start + 1)
 
+            card = image_bgr[y_start:y_end, x_start:x_end]
+            # Track the rectangle that corresponds to what we actually saved
+            final_abs_x0, final_abs_y0, final_abs_x1, final_abs_y1 = x_start, y_start, x_end, y_end
+            if tighten_to_card:
+                if tighten_size_constrained:
+                    tightened_img, bbox = tighten_crop_to_card_edges_size_constrained(
+                        cell_bgr=card,
+                        margin_px=tighten_margin_px,
+                        aspect_target=card_aspect,
+                        aspect_tolerance=card_aspect_tolerance,
+                        is_first_row=(first_row_at_image_top and row_index == 0),
+                        anchor_top_max_shift_px=anchor_top_max_shift_px,
+                    )
+                else:
+                    tightened_img, bbox = tighten_crop_to_card_edges(card, tighten_margin_px)
+                if tightened_img is not None and tightened_img.size != 0:
+                    card = tightened_img
+                    bx0, by0, bx1, by1 = bbox
+                    final_abs_x0 = x_start + int(bx0)
+                    final_abs_y0 = y_start + int(by0)
+                    final_abs_x1 = x_start + int(bx1)
+                    final_abs_y1 = y_start + int(by1)
+            # Draw the final rectangle (tightened if applied, otherwise inner-margin box)
             if debug_overlay is not None:
                 cv2.rectangle(
                     debug_overlay,
-                    (int(x_start), int(y_start)),
-                    (int(x_end - 1), int(y_end - 1)),
+                    (int(final_abs_x0), int(final_abs_y0)),
+                    (int(final_abs_x1 - 1), int(final_abs_y1 - 1)),
                     (0, 0, 255),
                     2,
                 )
-
-            card = image_bgr[y_start:y_end, x_start:x_end]
-            if tighten_to_card:
-                tightened = tighten_crop_to_card_edges(card, tighten_margin_px)
-                if tightened is not None and tightened.size != 0:
-                    card = tightened
             if card.size == 0:
                 continue
 
@@ -260,10 +282,10 @@ def crop_cells_from_grid(
     return saved
 
 
-def tighten_crop_to_card_edges(cell_bgr: np.ndarray, margin_px: int = 2) -> np.ndarray:
+def tighten_crop_to_card_edges(cell_bgr: np.ndarray, margin_px: int = 2) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
     height, width = cell_bgr.shape[:2]
     if height < 10 or width < 10:
-        return cell_bgr
+        return cell_bgr, (0, 0, width, height)
 
     gray = cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -305,7 +327,7 @@ def tighten_crop_to_card_edges(cell_bgr: np.ndarray, margin_px: int = 2) -> np.n
                 best_bbox = (x, y, w, h)
 
     if best_bbox is None:
-        return cell_bgr
+        return cell_bgr, (0, 0, width, height)
 
     x, y, w, h = best_bbox
     x0 = max(x + margin_px, 0)
@@ -313,8 +335,101 @@ def tighten_crop_to_card_edges(cell_bgr: np.ndarray, margin_px: int = 2) -> np.n
     x1 = min(x + w - margin_px, width)
     y1 = min(y + h - margin_px, height)
     if x1 <= x0 or y1 <= y0:
-        return cell_bgr
-    return cell_bgr[y0:y1, x0:x1]
+        return cell_bgr, (0, 0, width, height)
+    return cell_bgr[y0:y1, x0:x1], (x0, y0, x1, y1)
+
+
+def tighten_crop_to_card_edges_size_constrained(
+    cell_bgr: np.ndarray,
+    margin_px: int = 2,
+    aspect_target: float = 1.75,
+    aspect_tolerance: float = 0.15,
+    is_first_row: bool = False,
+    anchor_top_max_shift_px: int = 12,
+) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    height, width = cell_bgr.shape[:2]
+    if height < 10 or width < 10:
+        return cell_bgr, (0, 0, width, height)
+
+    gray = cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Binary candidates
+    _, thr = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, thr_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Edge candidate
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+
+    # Morphology to bridge dashed lines and suppress thin grid lines
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+    cand1 = cv2.morphologyEx(thr_inv, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    cand1 = cv2.morphologyEx(cand1, cv2.MORPH_OPEN, open_kernel, iterations=1)
+
+    cand2 = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    combined = cv2.bitwise_or(cand1, cand2)
+
+    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return cell_bgr, (0, 0, width, height)
+
+    cell_area = float(height * width)
+    aspect_min = max(1.0, aspect_target * (1.0 - aspect_tolerance))
+    aspect_max = aspect_target * (1.0 + aspect_tolerance)
+
+    best_bbox = None
+    best_score = -1.0
+
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area < 0.2 * cell_area or area > 0.995 * cell_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < 10 or h < 10:
+            continue
+        rect_area = float(w * h)
+        if rect_area <= 0:
+            continue
+
+        # Aspect as width/height >= 1
+        long_side = max(w, h)
+        short_side = min(w, h)
+        aspect = long_side / float(max(short_side, 1))
+        if aspect < aspect_min or aspect > aspect_max:
+            continue
+
+        rectangularity = area / rect_area
+        area_ratio = rect_area / cell_area
+
+        # Score: prefer aspect near target, high rectangularity, medium-large area
+        aspect_score = 1.0 - abs(aspect - aspect_target) / max(aspect_target, 1e-5)
+        area_score = 1.0 - abs(area_ratio - 0.75)  # prefer ~75% fill but flexible
+        score = 0.55 * aspect_score + 0.35 * rectangularity + 0.10 * area_score
+
+        # Anchor bonus: if first row expected to touch top, prefer small y
+        if is_first_row:
+            if y <= max(anchor_top_max_shift_px, margin_px):
+                score += 0.08
+
+        if score > best_score:
+            best_score = score
+            best_bbox = (x, y, w, h)
+
+    if best_bbox is None:
+        return cell_bgr, (0, 0, width, height)
+
+    x, y, w, h = best_bbox
+    x0 = max(x + margin_px, 0)
+    y0 = max(y + margin_px, 0)
+    x1 = min(x + w - margin_px, width)
+    y1 = min(y + h - margin_px, height)
+    if x1 <= x0 or y1 <= y0:
+        return cell_bgr, (0, 0, width, height)
+    return cell_bgr[y0:y1, x0:x1], (x0, y0, x1, y1)
 
 
 def main() -> None:
@@ -362,6 +477,34 @@ def main() -> None:
         type=int,
         default=2,
         help="Margin to shave inside the detected card rectangle when tightening (default: 2).",
+    )
+    parser.add_argument(
+        "--tighten-size-constrained",
+        action="store_true",
+        help="Use size- and anchor-constrained tightening: aspect and top-edge anchoring to find card edges more robustly.",
+    )
+    parser.add_argument(
+        "--card-aspect",
+        type=float,
+        default=1.75,
+        help="Target long-side/short-side aspect ratio of a card (default: 1.75 ~ 85.6x54mm).",
+    )
+    parser.add_argument(
+        "--card-aspect-tolerance",
+        type=float,
+        default=0.15,
+        help="Relative tolerance for aspect match (default: 0.15 for ±15%).",
+    )
+    parser.add_argument(
+        "--first-row-at-image-top",
+        action="store_true",
+        help="Assume first row of cards touches the top of the scan; anchors top edge during tightening.",
+    )
+    parser.add_argument(
+        "--anchor-top-max-shift-px",
+        type=int,
+        default=12,
+        help="When anchoring the first row to the top, allow this many pixels of slack from the cell's top.",
     )
     parser.add_argument(
         "--rows",
@@ -470,6 +613,11 @@ def main() -> None:
         debug_overlay_path=(
             os.path.join(args.output, "_debug_04_crop_boxes.png") if args.debug else None
         ),
+        tighten_size_constrained=bool(args.tighten_size_constrained),
+        card_aspect=float(args.card_aspect),
+        card_aspect_tolerance=float(args.card_aspect_tolerance),
+        first_row_at_image_top=bool(args.first_row_at_image_top),
+        anchor_top_max_shift_px=int(args.anchor_top_max_shift_px),
     )
 
     print(f"Saved {saved} cropped cards to: {args.output}")
