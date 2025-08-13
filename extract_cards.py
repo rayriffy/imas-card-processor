@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -208,11 +208,16 @@ def crop_cells_from_grid(
     zero_pad: bool,
     tighten_to_card: bool,
     tighten_margin_px: int,
+    debug_overlay_path: Optional[str] = None,
 ) -> int:
     saved = 0
     num_rows = max(0, len(horizontal_positions) - 1)
     num_cols = max(0, len(vertical_positions) - 1)
     pad_fmt = 2 if zero_pad else 0
+
+    debug_overlay = None
+    if debug_overlay_path:
+        debug_overlay = image_bgr.copy()
 
     for row_index in range(num_rows):
         y1 = horizontal_positions[row_index]
@@ -225,6 +230,15 @@ def crop_cells_from_grid(
             y_end = max(min(y2 - inner_margin_px, image_bgr.shape[0]), y_start + 1)
             x_start = max(x1 + inner_margin_px, 0)
             x_end = max(min(x2 - inner_margin_px, image_bgr.shape[1]), x_start + 1)
+
+            if debug_overlay is not None:
+                cv2.rectangle(
+                    debug_overlay,
+                    (int(x_start), int(y_start)),
+                    (int(x_end - 1), int(y_end - 1)),
+                    (0, 0, 255),
+                    2,
+                )
 
             card = image_bgr[y_start:y_end, x_start:x_end]
             if tighten_to_card:
@@ -239,6 +253,9 @@ def crop_cells_from_grid(
             filename = f"{row_label}-{col_label}.png"
             cv2.imwrite(os.path.join(output_dir, filename), card)
             saved += 1
+
+    if debug_overlay is not None:
+        cv2.imwrite(debug_overlay_path, debug_overlay)
 
     return saved
 
@@ -450,6 +467,9 @@ def main() -> None:
         zero_pad=bool(args.zero_pad),
         tighten_to_card=bool(args.tighten_to_card),
         tighten_margin_px=int(args.tighten_margin_px),
+        debug_overlay_path=(
+            os.path.join(args.output, "_debug_04_crop_boxes.png") if args.debug else None
+        ),
     )
 
     print(f"Saved {saved} cropped cards to: {args.output}")
