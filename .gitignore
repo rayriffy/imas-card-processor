@@ -1,3 +1,4 @@
 *.png
 .venv
 .idea
+!sample*.png
