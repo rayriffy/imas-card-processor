@@ -220,6 +220,7 @@ def crop_cells_from_grid(
     row_align_tolerance_px: int = 4,
     normalize_width_per_row: bool = False,
     width_tolerance_ratio: float = 0.05,
+    log_sizes: bool = False,
 ) -> int:
     saved = 0
     num_rows = max(0, len(horizontal_positions) - 1)
@@ -277,6 +278,12 @@ def crop_cells_from_grid(
                     (final_abs_x0, final_abs_y0, final_abs_x1, final_abs_y1),
                 )
             )
+            if log_sizes:
+                rect_w = int(final_abs_x1 - final_abs_x0)
+                rect_h = int(final_abs_y1 - final_abs_y0)
+                print(
+                    f"Detected rect r{row_index+1}-c{col_index+1}: width={rect_w}px height={rect_h}px"
+                )
 
     # Optional height normalization pass
     if normalize_height and staged:
@@ -299,7 +306,9 @@ def crop_cells_from_grid(
         best_cluster = max(clusters, key=lambda c: len(c)) if clusters else []
         target_height = int(round(float(np.median([heights[i] for i in best_cluster])))) if best_cluster else None
         if target_height and len(best_cluster) >= 2:
-            print(f"Height normalization: target={target_height}px from {len(best_cluster)}/{len(staged)} cards (tolerance {height_tolerance_ratio*100:.1f}%).")
+            print(
+                f"Height normalization: target={target_height}px from {len(best_cluster)}/{len(staged)} cards (tolerance {height_tolerance_ratio*100:.1f}%)."
+            )
             # Adjust each staged rect to target height, bounded by its allowed cell
             new_staged: List[Tuple[int, int, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = []
             for (row_index, col_index, allowed, rect) in staged:
@@ -656,31 +665,12 @@ def main() -> None:
         action="store_true",
         help="Treat image borders as grid lines if outer lines are missing.",
     )
-    parser.add_argument(
-        "--zero-pad",
-        action="store_true",
-        help="Zero-pad row/column numbers in filenames (e.g., 01-02.png).",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Save intermediate debug images into the output directory.",
-    )
-    parser.add_argument(
-        "--tighten-to-card",
-        action="store_true",
-        help="Within each grid cell, tighten the crop to the dominant rectangular contour (card edges).",
-    )
+    # Always enabled features (previously flags): zero-pad, debug, tighten-to-card (size-constrained)
     parser.add_argument(
         "--tighten-margin-px",
         type=int,
         default=2,
         help="Margin to shave inside the detected card rectangle when tightening (default: 2).",
-    )
-    parser.add_argument(
-        "--tighten-size-constrained",
-        action="store_true",
-        help="Use size- and anchor-constrained tightening: aspect and top-edge anchoring to find card edges more robustly.",
     )
     parser.add_argument(
         "--card-aspect",
@@ -729,9 +719,15 @@ def main() -> None:
         help="Only shift a crop to row alignment if it deviates by more than this many pixels (default: 4).",
     )
     parser.add_argument(
-        "--normalize-width-per-row",
+        "--normalize-width",
         action="store_true",
         help="Within each row, normalize crop width to the dominant width (bounded by each cell).",
+    )
+    # Backward compatibility (deprecated)
+    parser.add_argument(
+        "--normalize-width-per-row",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--width-tolerance-ratio",
@@ -768,11 +764,10 @@ def main() -> None:
     if args.force_equal_grid and args.rows and args.cols:
         # Skip detection entirely
         binary = adaptive_binary(image_gray)
-        if args.debug:
-            horizontal_mask, vertical_mask = extract_line_masks(binary)
-            cv2.imwrite(os.path.join(args.output, "_debug_01_binary.png"), binary)
-            cv2.imwrite(os.path.join(args.output, "_debug_02_horizontal_mask.png"), horizontal_mask)
-            cv2.imwrite(os.path.join(args.output, "_debug_03_vertical_mask.png"), vertical_mask)
+        horizontal_mask, vertical_mask = extract_line_masks(binary)
+        cv2.imwrite(os.path.join(args.output, "_debug_01_binary.png"), binary)
+        cv2.imwrite(os.path.join(args.output, "_debug_02_horizontal_mask.png"), horizontal_mask)
+        cv2.imwrite(os.path.join(args.output, "_debug_03_vertical_mask.png"), vertical_mask)
 
         horizontal_positions = compute_uniform_positions(height, int(args.rows))
         vertical_positions = compute_uniform_positions(width, int(args.cols))
@@ -789,10 +784,9 @@ def main() -> None:
 
         horizontal_mask, vertical_mask = extract_line_masks(binary)
 
-        if args.debug:
-            cv2.imwrite(os.path.join(args.output, "_debug_01_binary.png"), binary)
-            cv2.imwrite(os.path.join(args.output, "_debug_02_horizontal_mask.png"), horizontal_mask)
-            cv2.imwrite(os.path.join(args.output, "_debug_03_vertical_mask.png"), vertical_mask)
+        cv2.imwrite(os.path.join(args.output, "_debug_01_binary.png"), binary)
+        cv2.imwrite(os.path.join(args.output, "_debug_02_horizontal_mask.png"), horizontal_mask)
+        cv2.imwrite(os.path.join(args.output, "_debug_03_vertical_mask.png"), vertical_mask)
 
         horizontal_positions_raw = detect_line_positions_from_mask(
             horizontal_mask, axis=1, length_threshold_ratio=float(args.length_threshold)
@@ -840,13 +834,11 @@ def main() -> None:
         vertical_positions=sorted(vertical_positions),
         inner_margin_px=int(args.inner_margin_px),
         output_dir=args.output,
-        zero_pad=bool(args.zero_pad),
-        tighten_to_card=bool(args.tighten_to_card),
+        zero_pad=True,
+        tighten_to_card=True,
         tighten_margin_px=int(args.tighten_margin_px),
-        debug_overlay_path=(
-            os.path.join(args.output, "_debug_04_crop_boxes.png") if args.debug else None
-        ),
-        tighten_size_constrained=bool(args.tighten_size_constrained),
+        debug_overlay_path=os.path.join(args.output, "_debug_04_crop_boxes.png"),
+        tighten_size_constrained=True,
         card_aspect=float(args.card_aspect),
         card_aspect_tolerance=float(args.card_aspect_tolerance),
         first_row_at_image_top=bool(args.first_row_at_image_top),
@@ -855,8 +847,9 @@ def main() -> None:
         height_tolerance_ratio=float(args.height_tolerance_ratio),
         row_align=str(args.row_align),
         row_align_tolerance_px=int(args.row_align_tolerance_px),
-        normalize_width_per_row=bool(args.normalize_width_per_row),
+        normalize_width_per_row=bool(args.normalize_width or args.normalize_width_per_row),
         width_tolerance_ratio=float(args.width_tolerance_ratio),
+        log_sizes=True,
     )
 
     print(f"Saved {saved} cropped cards to: {args.output}")

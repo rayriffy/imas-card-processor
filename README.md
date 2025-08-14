@@ -82,9 +82,7 @@ Key flags
   - `--length-threshold f` (default 0.5): min fraction of orthogonal dimension to accept a line.
   - `--inner-margin-px n` (default 5): shave inside each grid cell to avoid line artifacts.
 - Tightening to card:
-  - `--tighten-to-card`: enable card-edge refinement per cell.
   - `--tighten-margin-px n` (default 2): inset when tightening.
-  - `--tighten-size-constrained`: robust tightening with morphology + aspect/area checks.
   - `--card-aspect a` (default 1.75), `--card-aspect-tolerance t` (default 0.15).
   - `--first-row-at-image-top`: prefer top-anchored card in first row.
   - `--anchor-top-max-shift-px n` (default 12): allowable slack from the cell’s top.
@@ -94,18 +92,15 @@ Key flags
   - `--row-align {auto,top,bottom}` (default auto): align cards per row by the straighter edge.
   - `--row-align-tolerance-px n` (default 4): only shift if deviation exceeds this.
 - Per-row width normalization:
-  - `--normalize-width-per-row`: use dominant width within each row.
+  - `--normalize-width`: use dominant width within each row.
   - `--width-tolerance-ratio r` (default 0.05): tolerance for width clustering per row.
-- Output:
-  - `--zero-pad`: name files like `01-03.png`.
-  - `--debug`: write `_debug_01_binary.png`, `_debug_02_horizontal_mask.png`, `_debug_03_vertical_mask.png`, `_debug_04_crop_boxes.png`.
 
 Tuning notes
 ------------
 - Line residue in crops: increase `--inner-margin-px` to 8–12.
 - Plastic/pocket edges leaking in: increase `--tighten-margin-px` to 4–6.
 - Too few lines detected: lower `--length-threshold` to 0.35–0.45 and/or `--include-image-borders`.
-- If cards vary slightly in size: keep `--normalize-height` on; width differences handled by `--normalize-width-per-row` per row.
+- If cards vary slightly in size: keep `--normalize-height` on; width differences handled by `--normalize-width` per row.
 
 Outputs
 -------
@@ -124,16 +119,16 @@ Troubleshooting
 
 ```
 python3 /Users/rayriffy/Downloads/nei/extract_cards.py \
-  --input /Users/rayriffy/Downloads/nei/01-1.png \
-  --output /Users/rayriffy/Downloads/nei/01-1 \
-  --rows 2 --cols 5 \
-  --include-image-borders \
-  --zero-pad \
-  --tighten-to-card --tighten-size-constrained \
-  --first-row-at-image-top --anchor-top-max-shift-px 12 \
-  --card-aspect 1.75 --card-aspect-tolerance 0.15 \
-  --normalize-height --height-tolerance-ratio 0.04 \
-  --row-align auto --row-align-tolerance-px 4 \
-  --normalize-width-per-row --width-tolerance-ratio 0.05 \
-  --debug
+        --input /Users/rayriffy/Downloads/nei/sample_01-2.png \
+        --output /Users/rayriffy/Downloads/nei/01-2 \
+        --rows 2 --cols 5 \
+        --include-image-borders \
+        --zero-pad \
+        --tighten-to-card --tighten-size-constrained \
+        --first-row-at-image-top --anchor-top-max-shift-px 12 \
+        --card-aspect 1.75 --card-aspect-tolerance 0.15 \
+        --normalize-height --height-tolerance-ratio 0.04 \
+        --row-align auto --row-align-tolerance-px 4 \
+        --normalize-width-per-row --width-tolerance-ratio 0.05 \
+        --debug
 ```
