@@ -123,12 +123,9 @@ python3 /Users/rayriffy/Downloads/nei/extract_cards.py \
         --output /Users/rayriffy/Downloads/nei/01-2 \
         --rows 2 --cols 5 \
         --include-image-borders \
-        --zero-pad \
-        --tighten-to-card --tighten-size-constrained \
         --first-row-at-image-top --anchor-top-max-shift-px 12 \
         --card-aspect 1.75 --card-aspect-tolerance 0.15 \
-        --normalize-height --height-tolerance-ratio 0.04 \
         --row-align auto --row-align-tolerance-px 4 \
-        --normalize-width-per-row --width-tolerance-ratio 0.05 \
-        --debug
+        --normalize-height --height-tolerance-ratio 0.04 \
+        --normalize-width --width-tolerance-ratio 0.05
 ```
